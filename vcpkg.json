@@ -1,0 +1,8 @@
+{
+    "name": "netforge",
+    "version": "1.0.0",
+    "description": "Lightweight C++ networking library with TLS support",
+    "dependencies": [
+        "openssl"
+    ]
+}

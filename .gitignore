@@ -1,0 +1,9 @@
+build/
+out/
+cmake-build-*/
+.vs/
+.vscode/
+*.user
+*.suo
+*.sln.docstates
+CMakeUserPresets.json

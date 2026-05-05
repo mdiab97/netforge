@@ -1,0 +1,76 @@
+#pragma once
+
+#include "netforge/transport.hpp"
+#include "netforge/message.hpp"
+#include "netforge/connection.hpp"
+
+#include <atomic>
+#include <functional>
+#include <memory>
+#include <string>
+#include <thread>
+#include <vector>
+#include "netforge/spsc_queue.hpp"
+
+namespace netforge {
+
+struct ClientConfig {
+    std::string host{"127.0.0.1"};
+    uint16_t port{9000};
+};
+
+class Client {
+public:
+    using ConnectCallback = std::function<void()>;
+    using DisconnectCallback = std::function<void()>;
+    using MessageCallback = std::function<void(Message)>;
+
+    Client();
+    ~Client();
+
+    Client(const Client&) = delete;
+    Client& operator=(const Client&) = delete;
+
+    void on_connect(ConnectCallback cb);
+    void on_disconnect(DisconnectCallback cb);
+    void on_message(MessageCallback cb);
+
+    // Connect to server (spawns I/O thread for receiving)
+    bool connect(const ClientConfig& config);
+
+    // Disconnect from server
+    void disconnect();
+
+    // Send a message (thread-safe, queues to I/O thread)
+    void send(const Message& msg);
+
+    // Process incoming events on the calling thread (fires callbacks)
+    void poll();
+
+    bool is_connected() const { return connected_.load(std::memory_order_relaxed); }
+
+private:
+    void io_thread_func();
+
+    struct IncomingEvent {
+        enum Type { Connected, Disconnected, Data };
+        Type type;
+        Message message;
+    };
+
+    Connection conn_;
+    ClientConfig config_;
+
+    std::unique_ptr<SpscQueue<IncomingEvent, 4096>> incoming_queue_;
+    std::unique_ptr<SpscQueue<std::vector<uint8_t>, 4096>> outgoing_queue_;
+
+    ConnectCallback on_connect_cb_;
+    DisconnectCallback on_disconnect_cb_;
+    MessageCallback on_message_cb_;
+
+    std::thread io_thread_;
+    std::atomic<bool> running_{false};
+    std::atomic<bool> connected_{false};
+};
+
+} // namespace netforge
