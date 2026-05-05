@@ -1,5 +1,8 @@
 #include "netforge/transport.hpp"
 
+#include <algorithm>
+#include <climits>
+
 #ifdef _WIN32
     #pragma comment(lib, "ws2_32.lib")
     #pragma comment(lib, "mswsock.lib")
@@ -120,21 +123,22 @@ bool would_block() {
 }
 
 int socket_send(socket_t sock, const uint8_t* data, size_t len) {
+    // Clamp to INT_MAX to prevent integer overflow when casting to int
+    int chunk = static_cast<int>((std::min)(len, static_cast<size_t>(INT_MAX)));
 #ifdef _WIN32
-    int result = ::send(sock, reinterpret_cast<const char*>(data), static_cast<int>(len), 0);
+    return ::send(sock, reinterpret_cast<const char*>(data), chunk, 0);
 #else
-    int result = static_cast<int>(::send(sock, data, len, MSG_NOSIGNAL));
+    return static_cast<int>(::send(sock, data, chunk, MSG_NOSIGNAL));
 #endif
-    return result;
 }
 
 int socket_recv(socket_t sock, uint8_t* buf, size_t len) {
+    int chunk = static_cast<int>((std::min)(len, static_cast<size_t>(INT_MAX)));
 #ifdef _WIN32
-    int result = ::recv(sock, reinterpret_cast<char*>(buf), static_cast<int>(len), 0);
+    return ::recv(sock, reinterpret_cast<char*>(buf), chunk, 0);
 #else
-    int result = static_cast<int>(::recv(sock, buf, len, 0));
+    return static_cast<int>(::recv(sock, buf, chunk, 0));
 #endif
-    return result;
 }
 
 } // namespace netforge

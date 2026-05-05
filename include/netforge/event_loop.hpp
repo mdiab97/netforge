@@ -2,13 +2,16 @@
 
 #include "netforge/transport.hpp"
 
-#include <functional>
 #include <vector>
+
+#ifdef _WIN32
+    #include <unordered_map>
+#endif
 
 namespace netforge {
 
 // Platform abstraction for I/O multiplexing.
-// Uses IOCP on Windows, epoll on Linux.
+// Uses WSAPoll on Windows, epoll (edge-triggered) on Linux.
 class EventLoop {
 public:
     EventLoop();
@@ -17,13 +20,8 @@ public:
     EventLoop(const EventLoop&) = delete;
     EventLoop& operator=(const EventLoop&) = delete;
 
-    // Register a socket for read/write event monitoring
     bool add(socket_t sock, void* user_data);
-
-    // Modify interest: enable/disable write notifications
     bool set_writable(socket_t sock, bool want_write, void* user_data);
-
-    // Remove a socket from monitoring
     void remove(socket_t sock);
 
     struct Event {
@@ -38,16 +36,20 @@ public:
 
 private:
 #ifdef _WIN32
-    // On Windows, we use select() for simplicity in a portable manner.
-    // True IOCP requires overlapped I/O which is complex; we use a high-performance
-    // select/poll loop that still handles thousands of connections on a single thread.
-    // For production MMO, this would be replaced with full IOCP overlapped model.
     struct SocketEntry {
-        socket_t sock;
         void* user_data;
+        size_t poll_index; // index into pollfds_ array
         bool want_write;
     };
-    std::vector<SocketEntry> sockets_;
+
+    // O(1) lookup by socket handle
+    std::unordered_map<socket_t, SocketEntry> entries_;
+
+    // Cached poll array — rebuilt only when sockets are added/removed
+    std::vector<WSAPOLLFD> pollfds_;
+    std::vector<socket_t> poll_sockets_; // parallel array mapping index -> socket
+    bool dirty_{false}; // true when pollfds_ needs rebuild
+    void rebuild_pollfds();
 #else
     int epoll_fd_{-1};
 #endif

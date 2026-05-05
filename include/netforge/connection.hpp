@@ -5,6 +5,7 @@
 #include "netforge/buffer_pool.hpp"
 
 #include <cstdint>
+#include <memory>
 #include <vector>
 #include <deque>
 
@@ -13,10 +14,17 @@ namespace netforge {
 using ConnectionId = uint64_t;
 
 enum class ConnectionState {
-    Connecting,
     Connected,
-    Disconnecting,
     Closed
+};
+
+// Shared write data — avoids copying the same message N times during broadcast.
+// For unicast, the shared_ptr overhead is negligible compared to the send syscall.
+using SharedData = std::shared_ptr<std::vector<uint8_t>>;
+
+struct WriteEntry {
+    SharedData data;
+    size_t offset{0}; // partial send progress within this entry
 };
 
 // Connection is a plain state struct. No threads, no async logic.
@@ -28,11 +36,10 @@ struct Connection {
 
     // Read buffer: accumulates incoming bytes until a full message is parsed
     std::vector<uint8_t> read_buf;
-    size_t read_pos{0}; // bytes currently in read_buf
+    size_t read_pos{0};
 
-    // Write queue: serialized messages waiting to be flushed
-    std::deque<std::vector<uint8_t>> write_queue;
-    size_t write_offset{0}; // offset into front of write_queue (partial send)
+    // Write queue: shared data entries waiting to be flushed
+    std::deque<WriteEntry> write_queue;
 
     // Set when parse_messages couldn't push all parsed messages (queue full)
     bool needs_reparse{false};
@@ -45,7 +52,6 @@ struct Connection {
         state = ConnectionState::Closed;
         read_pos = 0;
         write_queue.clear();
-        write_offset = 0;
         needs_reparse = false;
     }
 
@@ -53,9 +59,12 @@ struct Connection {
         return !write_queue.empty();
     }
 
-    // Queue a serialized message for sending
+    void enqueue(SharedData data) {
+        write_queue.push_back({std::move(data), 0});
+    }
+
     void enqueue(std::vector<uint8_t> data) {
-        write_queue.push_back(std::move(data));
+        enqueue(std::make_shared<std::vector<uint8_t>>(std::move(data)));
     }
 };
 

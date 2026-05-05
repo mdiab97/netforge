@@ -5,6 +5,7 @@
 #include "netforge/connection.hpp"
 
 #include <atomic>
+#include <deque>
 #include <functional>
 #include <memory>
 #include <string>
@@ -35,22 +36,24 @@ public:
     void on_disconnect(DisconnectCallback cb);
     void on_message(MessageCallback cb);
 
-    // Connect to server (spawns I/O thread for receiving)
     bool connect(const ClientConfig& config);
-
-    // Disconnect from server
     void disconnect();
 
-    // Send a message (thread-safe, queues to I/O thread)
-    void send(const Message& msg);
+    // Send a message (thread-safe, queues to I/O thread).
+    // Returns false if the outgoing queue is full (caller should retry or drop).
+    bool send(const Message& msg);
 
     // Process incoming events on the calling thread (fires callbacks)
     void poll();
 
-    bool is_connected() const { return connected_.load(std::memory_order_relaxed); }
+    bool is_connected() const { return connected_.load(std::memory_order_acquire); }
 
 private:
     void io_thread_func();
+    bool read_incoming();
+    void parse_incoming();
+    void flush_outgoing();
+    void push_disconnect();
 
     struct IncomingEvent {
         enum Type { Connected, Disconnected, Data };
@@ -61,8 +64,12 @@ private:
     Connection conn_;
     ClientConfig config_;
 
-    std::unique_ptr<SpscQueue<IncomingEvent, 4096>> incoming_queue_;
-    std::unique_ptr<SpscQueue<std::vector<uint8_t>, 4096>> outgoing_queue_;
+    // Write buffer for partial sends (owned by I/O thread)
+    std::deque<WriteEntry> write_queue_;
+
+    static constexpr size_t kQueueCapacity = 131072;
+    std::unique_ptr<SpscQueue<IncomingEvent, kQueueCapacity>> incoming_queue_;
+    std::unique_ptr<SpscQueue<std::vector<uint8_t>, kQueueCapacity>> outgoing_queue_;
 
     ConnectCallback on_connect_cb_;
     DisconnectCallback on_disconnect_cb_;

@@ -1,6 +1,6 @@
 cmake_minimum_required(VERSION 3.16)
 project(NetForge
-    VERSION 2.0.0
+    VERSION 1.0.0
     DESCRIPTION "High-performance event-loop networking library for game servers"
     LANGUAGES CXX
 )

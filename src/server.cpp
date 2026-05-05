@@ -5,6 +5,9 @@
 
 namespace netforge {
 
+// Maximum write queue size per connection before we consider it a slow client
+static constexpr size_t kMaxWriteQueueSize = 256;
+
 Server::Server()
     : incoming_queue_(std::make_unique<SpscQueue<IncomingEvent, kQueueCapacity>>()),
       outgoing_queue_(std::make_unique<SpscQueue<OutgoingCommand, kQueueCapacity>>()) {}
@@ -18,7 +21,7 @@ void Server::on_disconnect(DisconnectCallback cb) { on_disconnect_cb_ = std::mov
 void Server::on_message(MessageCallback cb) { on_message_cb_ = std::move(cb); }
 
 bool Server::start(const ServerConfig& config) {
-    if (running_.load()) return false;
+    if (running_.load(std::memory_order_acquire)) return false;
 
     config_ = config;
 
@@ -39,7 +42,6 @@ bool Server::start(const ServerConfig& config) {
     event_loop_ = std::make_unique<EventLoop>();
     buffer_pool_ = std::make_unique<BufferPool>(config_.buffer_pool_size);
 
-    // Use a sentinel value for listen socket identification
     event_loop_->add(listen_socket_, nullptr);
 
     running_.store(true, std::memory_order_release);
@@ -49,7 +51,7 @@ bool Server::start(const ServerConfig& config) {
 }
 
 void Server::stop() {
-    if (!running_.load()) return;
+    if (!running_.load(std::memory_order_acquire)) return;
 
     running_.store(false, std::memory_order_release);
 
@@ -57,7 +59,6 @@ void Server::stop() {
         io_thread_.join();
     }
 
-    // Close all connections
     for (auto& [id, conn] : connections_) {
         close_socket(conn->socket);
     }
@@ -108,20 +109,15 @@ void Server::io_thread_func() {
     std::vector<EventLoop::Event> events;
     events.reserve(256);
 
-    while (running_.load(std::memory_order_relaxed)) {
-        // Process outgoing commands from game thread
+    while (running_.load(std::memory_order_acquire)) {
         process_outgoing();
 
-        // Poll for I/O events with zero timeout (non-blocking spin).
-        // This trades CPU usage for minimal latency, appropriate for game servers
-        // where the I/O thread runs on a dedicated core.
-        int n = event_loop_->poll(events, 0);
+        int n = event_loop_->poll(events, 1);
 
         for (int i = 0; i < n; ++i) {
             auto& ev = events[i];
 
             if (ev.user_data == nullptr) {
-                // This is the listen socket
                 handle_accept();
                 continue;
             }
@@ -137,27 +133,40 @@ void Server::io_thread_func() {
                 handle_read(*conn);
             }
 
+            // Check conn is still valid after read (may have been disconnected)
+            if (conn->state != ConnectionState::Connected) continue;
+
             if (ev.writable) {
                 handle_write(*conn);
             }
         }
 
-        // Also try to accept even without events (for select-based implementation)
         handle_accept();
 
-        // Retry parsing for connections where the incoming queue was previously full.
+        // Retry parsing for connections where the incoming queue was previously full
         for (auto& [id, conn] : connections_) {
             if (conn->needs_reparse && conn->state == ConnectionState::Connected) {
                 conn->needs_reparse = false;
                 parse_messages(*conn);
             }
         }
+
+        // Clean up closed connections
+        for (auto it = connections_.begin(); it != connections_.end(); ) {
+            if (it->second->state == ConnectionState::Closed) {
+                it = connections_.erase(it);
+            } else {
+                ++it;
+            }
+        }
     }
 }
 
 void Server::handle_accept() {
-    // Accept all pending connections
     for (int i = 0; i < 32; ++i) {
+        // Enforce max connections
+        if (connections_.size() >= config_.max_connections) break;
+
         socket_t client_sock = accept_connection(listen_socket_);
         if (client_sock == kInvalidSocket) break;
 
@@ -181,24 +190,25 @@ void Server::handle_accept() {
 
 void Server::handle_read(Connection& conn) {
     while (true) {
-        // Ensure read buffer has space
         if (conn.read_pos >= conn.read_buf.size()) {
+            if (conn.read_buf.size() >= kMaxPayloadSize + kMessageHeaderSize) {
+                // Buffer is at max and full — client is sending garbage
+                disconnect(conn);
+                return;
+            }
             conn.read_buf.resize(conn.read_buf.size() + kBufferSize);
         }
 
         size_t space = conn.read_buf.size() - conn.read_pos;
-        int bytes = socket_recv(conn.socket, conn.read_buf.data() + conn.read_pos,
-                                space);
+        int bytes = socket_recv(conn.socket, conn.read_buf.data() + conn.read_pos, space);
 
         if (bytes > 0) {
             conn.read_pos += bytes;
             parse_messages(conn);
         } else if (bytes == 0) {
-            // Clean disconnect
             disconnect(conn);
             return;
         } else {
-            // Would block or error
             if (!would_block()) {
                 disconnect(conn);
             }
@@ -209,17 +219,16 @@ void Server::handle_read(Connection& conn) {
 
 void Server::handle_write(Connection& conn) {
     while (!conn.write_queue.empty()) {
-        auto& front = conn.write_queue.front();
-        size_t remaining = front.size() - conn.write_offset;
+        auto& entry = conn.write_queue.front();
+        auto& buf = *entry.data;
+        size_t remaining = buf.size() - entry.offset;
 
-        int sent = socket_send(conn.socket, front.data() + conn.write_offset,
-                               remaining);
+        int sent = socket_send(conn.socket, buf.data() + entry.offset, remaining);
 
         if (sent > 0) {
-            conn.write_offset += sent;
-            if (conn.write_offset >= front.size()) {
+            entry.offset += sent;
+            if (entry.offset >= buf.size()) {
                 conn.write_queue.pop_front();
-                conn.write_offset = 0;
             }
         } else {
             if (!would_block()) {
@@ -229,7 +238,6 @@ void Server::handle_write(Connection& conn) {
         }
     }
 
-    // All writes flushed, disable write interest
     if (conn.write_queue.empty()) {
         event_loop_->set_writable(conn.socket, false, &conn);
     }
@@ -243,7 +251,7 @@ void Server::parse_messages(Connection& conn) {
         size_t total_size = kMessageHeaderSize + header.size;
 
         if (offset + total_size > conn.read_pos) {
-            break; // incomplete message, wait for more data
+            break;
         }
 
         Message msg;
@@ -255,7 +263,6 @@ void Server::parse_messages(Connection& conn) {
         ev.message = std::move(msg);
 
         if (!incoming_queue_->push(std::move(ev))) {
-            // Queue full - stop parsing, leave remaining data in buffer.
             conn.needs_reparse = true;
             break;
         }
@@ -263,7 +270,6 @@ void Server::parse_messages(Connection& conn) {
         offset += total_size;
     }
 
-    // Compact read buffer: move unprocessed bytes to front
     if (offset > 0) {
         size_t remaining = conn.read_pos - offset;
         if (remaining > 0) {
@@ -297,9 +303,7 @@ void Server::process_outgoing() {
                     bool was_empty = conn.write_queue.empty();
                     conn.enqueue(std::move(cmd->data));
                     if (was_empty) {
-                        // Try to send immediately
                         handle_write(conn);
-                        // If there's still data pending, enable write interest
                         if (conn.has_pending_writes()) {
                             event_loop_->set_writable(conn.socket, true, &conn);
                         }
@@ -308,11 +312,17 @@ void Server::process_outgoing() {
                 break;
             }
             case OutgoingCommand::Broadcast: {
+                // Share one copy across all connections instead of copying per client
+                auto shared = std::make_shared<std::vector<uint8_t>>(std::move(cmd->data));
                 for (auto& [id, conn_ptr] : connections_) {
                     if (conn_ptr->state == ConnectionState::Connected) {
                         auto& conn = *conn_ptr;
+
+                        // Backpressure: skip slow clients with bloated write queues
+                        if (conn.write_queue.size() >= kMaxWriteQueueSize) continue;
+
                         bool was_empty = conn.write_queue.empty();
-                        conn.enqueue(std::vector<uint8_t>(cmd->data));
+                        conn.enqueue(shared);
                         if (was_empty) {
                             handle_write(conn);
                             if (conn.has_pending_writes()) {
