@@ -68,7 +68,7 @@ int main() {
         server.broadcast(broadcast_msg);
     });
 
-    if (!server.start({.port = 9001})) {
+    if (!server.start_threaded({.port = 9001})) {
         std::fprintf(stderr, "Failed to start chat server on port 9001\n");
         return 1;
     }

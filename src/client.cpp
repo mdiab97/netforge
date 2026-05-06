@@ -33,6 +33,8 @@ bool Client::connect(const ClientConfig& config) {
     if (!net_init()) return false;
 
     conn_.reset();
+    read_buf_.resize(kBufferSize);
+    read_pos_ = 0;
     conn_.socket = create_tcp_socket();
     if (conn_.socket == kInvalidSocket) return false;
 
@@ -94,7 +96,7 @@ void Client::io_thread_func() {
         WSAPOLLFD pfd{};
         pfd.fd = conn_.socket;
         pfd.events = POLLWRNORM;
-        int result = WSAPoll(&pfd, 1, 5000);
+        int result = WSAPoll(&pfd, 1, config_.connect_timeout_ms);
         if (result <= 0 || (pfd.revents & POLLERR)) {
             push_disconnect();
             return;
@@ -105,7 +107,7 @@ void Client::io_thread_func() {
         FD_ZERO(&except_set);
         FD_SET(conn_.socket, &write_set);
         FD_SET(conn_.socket, &except_set);
-        timeval tv{5, 0};
+        timeval tv{config_.connect_timeout_ms / 1000, (config_.connect_timeout_ms % 1000) * 1000};
         int result = ::select(static_cast<int>(conn_.socket) + 1, nullptr, &write_set, &except_set, &tv);
         if (result <= 0 || FD_ISSET(conn_.socket, &except_set)) {
             push_disconnect();
@@ -211,19 +213,19 @@ void Client::flush_outgoing() {
 
 bool Client::read_incoming() {
     while (true) {
-        if (conn_.read_pos >= conn_.read_buf.size()) {
+        if (read_pos_ >= read_buf_.size()) {
             // Cap buffer growth to prevent memory exhaustion
-            if (conn_.read_buf.size() >= kMaxPayloadSize + kMessageHeaderSize) {
+            if (read_buf_.size() >= kMaxPayloadSize + kMessageHeaderSize) {
                 return false;
             }
-            conn_.read_buf.resize(conn_.read_buf.size() + kBufferSize);
+            read_buf_.resize(read_buf_.size() + kBufferSize);
         }
 
-        size_t space = conn_.read_buf.size() - conn_.read_pos;
-        int bytes = socket_recv(conn_.socket, conn_.read_buf.data() + conn_.read_pos, space);
+        size_t space = read_buf_.size() - read_pos_;
+        int bytes = socket_recv(conn_.socket, read_buf_.data() + read_pos_, space);
 
         if (bytes > 0) {
-            conn_.read_pos += bytes;
+            read_pos_ += bytes;
         } else if (bytes == 0) {
             return false;
         } else {
@@ -236,14 +238,14 @@ bool Client::read_incoming() {
 
 void Client::parse_incoming() {
     size_t offset = 0;
-    while (offset + kMessageHeaderSize <= conn_.read_pos) {
-        auto header = MessageHeader::decode(conn_.read_buf.data() + offset);
+    while (offset + kMessageHeaderSize <= read_pos_) {
+        auto header = MessageHeader::decode(read_buf_.data() + offset);
         size_t total_size = kMessageHeaderSize + header.size;
 
-        if (offset + total_size > conn_.read_pos) break;
+        if (offset + total_size > read_pos_) break;
 
         Message msg;
-        Message::deserialize(conn_.read_buf.data() + offset, total_size, msg);
+        Message::deserialize(read_buf_.data() + offset, total_size, msg);
 
         IncomingEvent ev;
         ev.type = IncomingEvent::Data;
@@ -258,11 +260,11 @@ void Client::parse_incoming() {
     }
 
     if (offset > 0) {
-        size_t remaining = conn_.read_pos - offset;
+        size_t remaining = read_pos_ - offset;
         if (remaining > 0) {
-            std::memmove(conn_.read_buf.data(), conn_.read_buf.data() + offset, remaining);
+            std::memmove(read_buf_.data(), read_buf_.data() + offset, remaining);
         }
-        conn_.read_pos = remaining;
+        read_pos_ = remaining;
     }
 }
 

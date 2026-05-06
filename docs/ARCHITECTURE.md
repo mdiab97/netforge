@@ -2,26 +2,100 @@
 
 ## Overview
 
-NetForge is a game/MMO networking library built around a single I/O thread driving an event loop, communicating with the game thread via lock-free queues. Every design decision optimizes for the constraints of real-time multiplayer: predictable latency, efficient scaling, and zero contention between game logic and network I/O.
+NetForge is a game/MMO networking library with a 3-thread architecture: an I/O thread for pure socket operations, a processing thread for message parsing and deserialization, and the game thread for application logic. All communication between threads uses lock-free SPSC queues with zero shared mutable state.
 
-## The Event Loop Model
+## Threading Model
 
-One I/O thread handles ALL connections using non-blocking sockets and platform event notification:
+NetForge does not own any threads. It exposes three tick functions that the user calls from whatever threads they choose:
 
-```
-Game Thread                    I/O Thread
-    |                              |
-    |--- outgoing queue --------->|
-    |    (lock-free SPSC)         |
-    |                              |--- event loop (poll/epoll)
-    |<--- incoming queue ---------|      handles ALL sockets
-    |    (lock-free SPSC)         |
-    |                              |
-    v                              v
- poll() fires callbacks       non-blocking read/write
+```cpp
+server.start(config);          // setup only, no threads spawned
+
+server.tick_io(timeout_ms);    // call from your I/O thread
+server.tick_process();         // call from your processing thread
+server.poll();                 // call from your game thread
 ```
 
-A single thread with non-blocking I/O can handle tens of thousands of connections because most sockets are idle at any given moment. The kernel tells us exactly which sockets have data ready, so we never waste time blocking.
+This lets you:
+- Run all three on a single thread (simple games, debugging)
+- Split I/O and processing across two threads
+- Dedicate a thread per function with custom affinity/priority
+- Integrate into an existing thread pool or job system
+
+A convenience method `start_threaded()` spawns I/O and processing threads internally for simple use cases.
+
+### Data Flow
+
+```
+Game Thread              I/O Thread              Processing Thread
+(poll, send,             (tick_io)               (tick_process)
+ broadcast)
+     |                        |                        |
+     |-- outgoing_queue_ --->|                        |
+     |   (serialized data)   |--- raw_queue_ ------->|
+     |                        |   (conn_id + bytes)   |
+     |<----------------- incoming_queue_ -------------|
+         (parsed Messages)
+```
+
+### tick_io()
+
+Pure socket operations — no parsing, no deserialization. Stays as lean as possible to minimize latency between the kernel and userspace.
+
+- `event_loop_.poll()` — check all sockets for readability/writability (WSAPoll/epoll)
+- `handle_read()` — `recv()` raw bytes into a temporary buffer, push to `raw_queue_`
+- `handle_write()` — `send()` from per-connection write queues
+- `handle_accept()` — accept new connections, register with event loop
+- `drain_outgoing()` — pop serialized data from `outgoing_queue_`, enqueue to write queues
+- `disconnect()` — close socket, signal processing thread
+
+### tick_process()
+
+Owns per-connection read buffers. Handles the heavy work that would otherwise block the I/O thread.
+
+- Pop `RawEvent` from `raw_queue_`
+- Maintain `ReadBuffer` per connection (accumulate partial data, track parse position)
+- Scan for complete messages (4-byte header check)
+- Deserialize payloads into `Message` objects
+- Push parsed `IncomingEvent` to `incoming_queue_`
+- Flush remaining data on disconnect
+- Future: encryption/decryption, compression, validation
+
+### poll()
+
+Game thread entry point. Pops parsed events and fires user callbacks.
+
+- `server.poll()` — pops from `incoming_queue_`, fires `on_connect`, `on_message`, `on_disconnect`
+- `server.send(id, msg)` — serializes and pushes to `outgoing_queue_`
+- `server.broadcast(msg)` — same, I/O thread fans out to all connections
+
+## Thread Ownership
+
+| Thread | Owns |
+|--------|------|
+| I/O Thread | EventLoop, Connection map (sockets + write queues), listen socket |
+| Processing Thread | ReadBuffer map (per-connection read state), deserialization |
+| Game Thread | Callbacks, game state, send()/broadcast() API |
+
+## SPSC Queues
+
+All inter-thread communication uses lock-free single-producer single-consumer ring buffers. No mutexes on the hot path.
+
+| Queue | Producer | Consumer | Carries |
+|-------|----------|----------|---------|
+| `outgoing_queue_` | Game Thread | I/O Thread | Serialized bytes (send/broadcast commands) |
+| `raw_queue_` | I/O Thread | Processing Thread | Raw received bytes + connect/disconnect signals |
+| `incoming_queue_` | Processing Thread | Game Thread | Parsed Messages + connect/disconnect events |
+
+### Why SPSC
+
+Each queue has exactly one writer and one reader. SPSC is simpler, faster, and provably correct without CAS loops. Power-of-two capacity enables fast modulo via bitmask. Head and tail are on separate cache lines (64-byte aligned) to prevent false sharing.
+
+### Memory Ordering
+
+- `memory_order_release` on writes ensures data is visible before the index update
+- `memory_order_acquire` on reads ensures we see the latest data
+- No stronger ordering needed because each queue has exactly one producer and one consumer
 
 ## Platform Differences
 
@@ -30,10 +104,10 @@ A single thread with non-blocking I/O can handle tens of thousands of connection
 - Must drain all available data when notified (loop until `EAGAIN`)
 - Single `epoll_wait()` call returns all ready file descriptors
 
-### Windows (WSAPoll / select)
-- Current implementation uses `WSAPoll` for portability
-- Upgrade path: IOCP with overlapped I/O for maximum performance
-- IOCP is completion-based (notifies after I/O completes) vs epoll which is readiness-based
+### Windows (WSAPoll)
+- Level-triggered: notifies whenever socket is ready
+- Socket entries stored in a hash map for O(1) lookup on `set_writable()`
+- Cached WSAPOLLFD array rebuilt only on add/remove, events updated inline
 
 The `EventLoop` abstraction hides these differences:
 - `add(socket, user_data)` — register interest
@@ -42,11 +116,10 @@ The `EventLoop` abstraction hides these differences:
 
 ## Buffer Pool
 
-Eliminates malloc/free on the hot path:
+Pre-allocated 4KB buffers eliminate malloc/free on the hot path:
 
 ```
 BufferPool
-  |
   |-- blocks_: vector<unique_ptr<Buffer[]>>  (owns memory)
   |-- free_list_: vector<Buffer*>            (available buffers)
   |
@@ -54,47 +127,24 @@ BufferPool
   release(Buffer*)      (push back to free_list)
 ```
 
-**Key properties:**
-- Fixed 4KB buffer size matches common MTU multiples and page size
-- Pre-allocated in chunks, grows by 64 buffers at a time
-- Never shrinks — once allocated, buffers stay in the pool forever
-- `reset()` clears the `used` counter without zeroing memory
-
-## Lock-Free SPSC Queue
-
-Bounded ring buffer with exactly one producer thread and one consumer thread. No locks.
-
-```
-          head (written by producer)
-            v
- [  ][  ][ A][ B][ C][  ][  ][  ]
-                        ^
-                       tail (written by consumer)
-```
-
-**How it works:**
-1. Producer advances `head` after writing an element
-2. Consumer advances `tail` after reading an element
-3. `memory_order_release` on writes ensures data is visible before the index update
-4. `memory_order_acquire` on reads ensures we see the latest data
-5. Power-of-two size enables fast modulo via bitmask: `index & (capacity - 1)`
-
-**Why SPSC and not MPMC?** There's exactly one producer (I/O thread) and one consumer (game thread) for incoming events, and vice versa for outgoing commands. SPSC is simpler, faster, and provably correct without CAS loops.
-
-**Cache line padding:** `head` and `tail` are on separate cache lines (64-byte aligned) to prevent false sharing between producer and consumer cores.
+- Fixed 4KB size matches page size and common MTU multiples
+- Grows in chunks of 64, never shrinks
+- `reset()` clears the used counter without zeroing memory
 
 ## Write Batching
 
 When the game thread calls `send()` or `broadcast()`, messages are not sent immediately:
 
-1. Message is serialized and pushed to the outgoing SPSC queue
-2. On the next I/O thread iteration, all queued commands are drained
-3. Messages are appended to each connection's `write_queue`
-4. The event loop flushes write queues in bulk
+1. Message is serialized and pushed to `outgoing_queue_`
+2. I/O thread drains all queued commands in `drain_outgoing()`
+3. Messages are appended to each connection's write queue
+4. The event loop flushes write queues when the socket is writable
 
-If the game thread sends 50 messages to a client during one tick, they all get queued and flushed together — potentially in a single `send()` syscall.
+Broadcast uses `SharedData` (`shared_ptr<vector<uint8_t>>`) so one serialized copy is shared across all connection write queues instead of being copied N times.
 
-**Partial writes:** If `send()` returns less than the full buffer (kernel buffer full), we track the offset and re-enable write notifications. On the next writable event, we continue from where we left off.
+## Backpressure
+
+Slow clients (write queue exceeding 256 entries) are skipped during broadcast. This prevents one slow connection from causing unbounded memory growth across the server.
 
 ## Compact Message Format
 
@@ -104,56 +154,27 @@ If the game thread sends 50 messages to a client during one tick, they all get q
   uint16      uint16          N bytes
 ```
 
-- **4 bytes total header** — minimal overhead for small game messages
+- **4 bytes total header** — minimal overhead for game messages
 - **Max 64KB payload** — sufficient for all game packets; larger data should be chunked
-- **No length-prefix ambiguity** — size is explicit, no delimiters to parse
-- **Native byte order** — both sides are assumed to be the same architecture (games control both client and server), avoiding unnecessary byte-swap overhead
+- **Native byte order** — both sides assumed same architecture (games control client and server)
 
-## Connection as State Struct
+## Connection Lifecycle
 
-A `Connection` is purely data — no threads, no async operations:
-
-```cpp
-struct Connection {
-    ConnectionId id;
-    socket_t socket;
-    ConnectionState state;
-    vector<uint8_t> read_buf;   // accumulate incoming bytes
-    size_t read_pos;            // cursor into read_buf
-    deque<vector<uint8_t>> write_queue;  // pending outgoing data
-    size_t write_offset;        // partial send progress
-};
-```
-
-The event loop drives all I/O by operating on these structs:
-- Cache-friendly (data locality)
-- Easy to reason about (no hidden state transitions)
-- Simple to debug (inspect any connection's state at any point)
-
-## Handling Partial Reads and Writes
-
-Non-blocking sockets may read/write fewer bytes than requested.
-
-**Reads:** Bytes accumulate in `read_buf` at position `read_pos`. The parser scans from the beginning looking for complete messages (header + full payload). Parsed messages are removed, remaining bytes compacted to the front.
-
-**Writes:** The front of `write_queue` tracks `write_offset`. If a send is partial, we remember where we stopped. On the next writable event, we continue from that offset. When a buffer is fully sent, it's popped and we move to the next.
-
-## Thread Safety Model
-
-- **Game thread**: Calls `poll()`, `send()`, `broadcast()`, registers callbacks
-- **I/O thread**: Handles all socket operations, never touches game state
-- **Communication**: Exclusively via SPSC queues (no shared mutable state)
-- **Callbacks**: Always fire on the game thread (inside `poll()`)
-
-Game logic never needs locks for networking operations.
+1. I/O thread accepts socket, creates `Connection` (socket + write queue), pushes `RawEvent::Connect` to `raw_queue_`
+2. Processing thread creates `ReadBuffer`, pushes `IncomingEvent::Connect` to `incoming_queue_`
+3. Game thread receives `on_connect(id)` callback
+4. Data flows: I/O recv -> raw_queue -> processing parse -> incoming_queue -> game callback
+5. On disconnect: I/O closes socket, pushes `RawEvent::Disconnect`, processing flushes remaining data, pushes `IncomingEvent::Disconnect`, game receives `on_disconnect(id)`
+6. I/O thread erases closed connections from its map each tick
 
 ## Performance Characteristics
 
 | Metric | Expected Range |
 |--------|---------------|
-| Connections | 10,000+ on single thread |
+| Connections | 10,000+ on single I/O thread |
 | Throughput | 10,000+ msgs/sec (echo, localhost) |
 | Latency | Sub-millisecond on localhost |
-| Memory per connection | ~4KB read buffer + write queue |
+| Memory per connection | Write queue + ReadBuffer (~4KB) |
 | Syscalls per tick | 1 poll + N send/recv (batched) |
 | Lock contention | Zero (SPSC queues are lock-free) |
+| Threads | 3 total (I/O, processing, game) |

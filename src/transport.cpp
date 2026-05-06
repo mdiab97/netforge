@@ -81,7 +81,11 @@ socket_t accept_connection(socket_t listen_sock) {
     socket_t client = ::accept(listen_sock, reinterpret_cast<sockaddr*>(&addr), &addr_len);
     if (client == kInvalidSocket) return kInvalidSocket;
 
-    set_nonblocking(client);
+    if (!set_nonblocking(client)) {
+        close_socket(client);
+        return kInvalidSocket;
+    }
+
     set_nodelay(client);
     return client;
 }

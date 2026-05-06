@@ -78,7 +78,7 @@ ctest --test-dir tests --build-config Debug
 
 ## Quick Start
 
-### Server
+### Server (auto-threaded)
 
 ```cpp
 #include <netforge/netforge.hpp>
@@ -87,27 +87,39 @@ ctest --test-dir tests --build-config Debug
 
 int main() {
     netforge::net_init();
-
     netforge::Server server;
 
     server.on_connect([](netforge::ConnectionId id) {
         std::printf("client %llu connected\n", (unsigned long long)id);
     });
-
     server.on_message([&](netforge::ConnectionId id, netforge::Message msg) {
-        server.send(id, msg); // echo back
+        server.send(id, msg);
     });
 
-    server.start({.port = 9000});
+    server.start_threaded({.port = 9000}); // spawns I/O + processing threads
 
-    // Game loop
     while (true) {
         server.poll(); // fires callbacks on game thread
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
+}
+```
 
-    server.stop();
-    netforge::net_cleanup();
+### Server (manual threading)
+
+```cpp
+netforge::Server server;
+// ... set callbacks ...
+server.start({.port = 9000}); // setup only, no threads
+
+// You control the threads:
+std::thread io([&] { while (running) server.tick_io(); });
+std::thread proc([&] { while (running) server.tick_process(); });
+
+// Game loop on main thread:
+while (running) {
+    server.poll();
+    game_update();
 }
 ```
 
@@ -144,23 +156,16 @@ int main() {
 
 ## Architecture
 
+Three tick functions, three SPSC queues, zero shared mutable state. You choose the threading.
+
 ```
-┌──────────────────────────────────────────────────────┐
-│                   Game Thread                         │
-│  (game logic, AI, physics, calls server.poll())      │
-└────────────────────────┬─────────────────────────────┘
-                         │ Lock-free SPSC Queues
-                         │ (incoming events / outgoing commands)
-┌────────────────────────▼─────────────────────────────┐
-│                   I/O Thread (1)                      │
-│  Event Loop (WSAPoll / epoll)                        │
-│  Handles: accept, read, write for ALL connections    │
-│  Non-blocking sockets, write batching                │
-├──────────────────────────────────────────────────────┤
-│  Connection Pool         │  Buffer Pool (4KB chunks) │
-│  (state structs, no      │  (pre-allocated, recycled │
-│   threads per conn)      │   zero malloc on hot path)│
-└──────────────────────────────────────────────────────┘
+server.tick_io()         server.tick_process()       server.poll()
+(pure socket I/O,        (message parsing,           (fire callbacks,
+ event loop)              deserialization)             game logic)
+     |                        |                        |
+     |-- outgoing_queue_ <---|<------------------------|
+     |--- raw_queue_ ------->|                         |
+     |                        |--- incoming_queue_ --->|
 ```
 
 ### Wire Format
@@ -176,12 +181,14 @@ Max payload: 65,535 bytes per message.
 
 | Decision | Rationale |
 |----------|-----------|
-| Single I/O thread | Avoids context-switch overhead of thread-per-connection; scales to 10K+ connections |
-| Lock-free SPSC queue | Zero mutex contention between game and network threads |
+| User-driven threading (tick functions) | No hidden threads. You call `tick_io()`, `tick_process()`, `poll()` from whatever threads you want. Integrate into any architecture |
+| Separate I/O and processing | I/O stays lean (pure syscalls). Processing handles deserialization, future encryption/compression |
+| Lock-free SPSC queues | Zero mutex contention between all three threads |
 | Buffer pool | Eliminates malloc/free on send/receive hot path |
 | Non-blocking + event loop | One syscall (poll/epoll_wait) checks all sockets at once |
 | 4-byte compact header | Minimal overhead; 64KB max keeps memory predictable |
 | `poll()` on game thread | Callbacks fire on the game thread — no synchronization needed in handlers |
+| SharedData for broadcast | One serialized copy shared across all write queues, not N copies |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full design documentation.
 

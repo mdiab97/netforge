@@ -35,10 +35,11 @@ size_t BufferPool::available() const {
 
 void BufferPool::grow(size_t count) {
     auto block = std::make_unique<Buffer[]>(count);
+    Buffer* base = block.get();
+    blocks_.push_back(std::move(block)); // transfer ownership first
     for (size_t i = 0; i < count; ++i) {
-        free_list_.push_back(&block[i]);
+        free_list_.push_back(&base[i]);
     }
-    blocks_.push_back(std::move(block));
     total_ += count;
 }
 

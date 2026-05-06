@@ -18,6 +18,7 @@ namespace netforge {
 struct ClientConfig {
     std::string host{"127.0.0.1"};
     uint16_t port{9000};
+    int connect_timeout_ms{5000};
 };
 
 class Client {
@@ -63,6 +64,10 @@ private:
 
     Connection conn_;
     ClientConfig config_;
+
+    // Client-local read buffer (not shared with server's processing thread)
+    std::vector<uint8_t> read_buf_;
+    size_t read_pos_{0};
 
     // Write buffer for partial sends (owned by I/O thread)
     std::deque<WriteEntry> write_queue_;

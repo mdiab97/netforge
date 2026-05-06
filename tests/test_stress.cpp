@@ -217,7 +217,7 @@ TEST_CASE("Decision: single poll vs per-socket blocking", "[stress][decisions]")
         server_msgs.fetch_add(1, std::memory_order_relaxed);
         server.send(id, msg);
     });
-    REQUIRE(server.start({.port = STRESS_PORT + 30}));
+    REQUIRE(server.start_threaded({.port = STRESS_PORT + 30}));
 
     auto t_start = std::chrono::steady_clock::now();
 

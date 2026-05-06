@@ -27,7 +27,7 @@ bool wait_for(Pred pred, std::chrono::milliseconds timeout = 3000ms) {
 
 TEST_CASE("Server starts and stops cleanly", "[integration]") {
     Server server;
-    REQUIRE(server.start({.port = TEST_PORT}));
+    REQUIRE(server.start_threaded({.port = TEST_PORT}));
     REQUIRE(server.is_running());
     server.stop();
     REQUIRE_FALSE(server.is_running());
@@ -41,7 +41,7 @@ TEST_CASE("Client connects to server", "[integration]") {
     server.on_connect([&](ConnectionId) {
         server_saw_connect.store(true);
     });
-    REQUIRE(server.start({.port = TEST_PORT + 1}));
+    REQUIRE(server.start_threaded({.port = TEST_PORT + 1}));
 
     Client client;
     client.on_connect([&]() {
@@ -69,7 +69,7 @@ TEST_CASE("Client sends message to server", "[integration]") {
         received_text = msg.as_string();
         received.store(true);
     });
-    REQUIRE(server.start({.port = TEST_PORT + 2}));
+    REQUIRE(server.start_threaded({.port = TEST_PORT + 2}));
 
     Client client;
     std::atomic<bool> connected{false};
@@ -104,7 +104,7 @@ TEST_CASE("Server sends message to client", "[integration]") {
     server.on_connect([&](ConnectionId id) {
         server_conn_id = id;
     });
-    REQUIRE(server.start({.port = TEST_PORT + 3}));
+    REQUIRE(server.start_threaded({.port = TEST_PORT + 3}));
 
     Client client;
     std::atomic<bool> connected{false};
@@ -143,7 +143,7 @@ TEST_CASE("Server broadcast reaches all clients", "[integration]") {
     server.on_connect([&](ConnectionId) {
         connections.fetch_add(1);
     });
-    REQUIRE(server.start({.port = TEST_PORT + 4}));
+    REQUIRE(server.start_threaded({.port = TEST_PORT + 4}));
 
     std::vector<std::unique_ptr<Client>> clients;
     for (int i = 0; i < NUM_CLIENTS; ++i) {
@@ -182,7 +182,7 @@ TEST_CASE("Disconnect callback fires", "[integration]") {
     server.on_disconnect([&](ConnectionId) {
         server_saw_disconnect.store(true);
     });
-    REQUIRE(server.start({.port = TEST_PORT + 5}));
+    REQUIRE(server.start_threaded({.port = TEST_PORT + 5}));
 
     Client client;
     std::atomic<bool> connected{false};
@@ -216,7 +216,7 @@ TEST_CASE("Echo roundtrip", "[integration]") {
     server.on_message([&](ConnectionId id, Message msg) {
         server.send(id, msg); // echo back
     });
-    REQUIRE(server.start({.port = TEST_PORT + 6}));
+    REQUIRE(server.start_threaded({.port = TEST_PORT + 6}));
 
     Client client;
     std::atomic<bool> connected{false};

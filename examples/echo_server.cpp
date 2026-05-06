@@ -33,7 +33,7 @@ int main() {
         server.send(id, msg);
     });
 
-    if (!server.start({.port = 9000})) {
+    if (!server.start_threaded({.port = 9000})) {
         std::fprintf(stderr, "Failed to start server on port 9000\n");
         return 1;
     }

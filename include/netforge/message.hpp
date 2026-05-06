@@ -69,6 +69,7 @@ public:
     static bool deserialize(const uint8_t* data, size_t len, Message& out) {
         if (len < kMessageHeaderSize) return false;
         auto h = MessageHeader::decode(data);
+        if (h.size > kMaxPayloadSize) return false;
         if (len < kMessageHeaderSize + h.size) return false;
         out.id_ = h.id;
         out.payload_.assign(data + kMessageHeaderSize, data + kMessageHeaderSize + h.size);
