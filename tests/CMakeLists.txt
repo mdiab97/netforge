@@ -17,6 +17,7 @@ add_executable(netforge_tests
     test_spsc_queue.cpp
     test_buffer_pool.cpp
     test_server_client.cpp
+    test_crypto.cpp
 )
 
 target_link_libraries(netforge_tests PRIVATE

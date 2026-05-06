@@ -187,12 +187,18 @@ void Server::handle_accept() {
             continue;
         }
 
-        connections_[id] = std::move(conn);
-
         RawEvent ev;
         ev.type = RawEvent::Connect;
         ev.conn_id = id;
-        raw_queue_->push(std::move(ev));
+
+        if (!raw_queue_->push(std::move(ev))) {
+            // Queue full — reject this connection
+            event_loop_->remove(client_sock);
+            close_socket(client_sock);
+            continue;
+        }
+
+        connections_[id] = std::move(conn);
     }
 }
 
@@ -345,6 +351,10 @@ void Server::process_raw_data(ConnectionId id, const uint8_t* data, size_t len) 
     if (it == read_buffers_.end()) return;
 
     auto& rb = it->second;
+
+    // Guard against overflow before arithmetic
+    if (len > kMaxPayloadSize + kMessageHeaderSize) return;
+    if (rb.pos > kMaxPayloadSize + kMessageHeaderSize) return;
 
     if (rb.pos + len > rb.buf.size()) {
         size_t needed = rb.pos + len;

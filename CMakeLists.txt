@@ -2,7 +2,7 @@ cmake_minimum_required(VERSION 3.16)
 project(NetForge
     VERSION 1.0.0
     DESCRIPTION "High-performance event-loop networking library for game servers"
-    LANGUAGES CXX
+    LANGUAGES C CXX
 )
 
 set(CMAKE_CXX_STANDARD 20)
@@ -11,13 +11,23 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 
 option(NETFORGE_BUILD_TESTS "Build unit tests" ON)
 option(NETFORGE_BUILD_EXAMPLES "Build example programs" ON)
-option(NETFORGE_ENABLE_TLS "Enable TLS support via OpenSSL" OFF)
 
 find_package(Threads REQUIRED)
 
-if(NETFORGE_ENABLE_TLS)
-    find_package(OpenSSL REQUIRED)
-endif()
+# Monocypher (vendored, single-file crypto library)
+add_library(monocypher STATIC
+    third_party/monocypher/monocypher.c
+)
+target_include_directories(monocypher
+    PUBLIC
+        $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/third_party/monocypher>
+        $<INSTALL_INTERFACE:include>
+)
+# Suppress warnings for third-party C code
+target_compile_options(monocypher PRIVATE
+    $<$<CXX_COMPILER_ID:MSVC>:/W0>
+    $<$<NOT:$<CXX_COMPILER_ID:MSVC>>:-w>
+)
 
 add_library(netforge
     src/transport.cpp
@@ -27,7 +37,9 @@ add_library(netforge
     src/client.cpp
     src/event_loop.cpp
     src/buffer_pool.cpp
-    src/crypto/tls_context.cpp
+    src/crypto/key_exchange.cpp
+    src/crypto/packet_cipher.cpp
+    src/crypto/handshake.cpp
 )
 
 target_include_directories(netforge
@@ -41,15 +53,11 @@ target_include_directories(netforge
 target_link_libraries(netforge
     PUBLIC
         Threads::Threads
+        monocypher
 )
 
-if(NETFORGE_ENABLE_TLS)
-    target_link_libraries(netforge PUBLIC OpenSSL::SSL OpenSSL::Crypto)
-    target_compile_definitions(netforge PUBLIC NETFORGE_TLS_ENABLED)
-endif()
-
 if(WIN32)
-    target_link_libraries(netforge PUBLIC ws2_32 mswsock)
+    target_link_libraries(netforge PUBLIC ws2_32 mswsock bcrypt)
 endif()
 
 target_compile_options(netforge PRIVATE
@@ -69,7 +77,7 @@ endif()
 include(CMakePackageConfigHelpers)
 include(GNUInstallDirs)
 
-install(TARGETS netforge
+install(TARGETS netforge monocypher
     EXPORT NetForgeTargets
     LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
     ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}

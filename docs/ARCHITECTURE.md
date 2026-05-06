@@ -158,6 +158,57 @@ Slow clients (write queue exceeding 256 entries) are skipped during broadcast. T
 - **Max 64KB payload** — sufficient for all game packets; larger data should be chunked
 - **Native byte order** — both sides assumed same architecture (games control client and server)
 
+## Encryption
+
+### Why Not TLS
+
+TLS is designed for HTTP — it adds 2-3 round-trip handshakes, requires certificate infrastructure, encrypts the entire TCP stream (no selective encryption), and adds per-record overhead that's unnecessary for game packets on trusted infrastructure. Games need fast key exchange and per-packet authenticated encryption.
+
+### Handshake: X25519 Key Exchange
+
+One round-trip. No certificates. Both sides generate ephemeral Curve25519 keypairs and exchange public keys. The shared secret is derived via X25519 Diffie-Hellman and then hashed through BLAKE2b to produce a uniform 32-byte session key.
+
+```
+Client                          Server
+  |                                |
+  |--- ClientHello [01][pubkey] -->|
+  |                                | generate keypair
+  |                                | derive shared key = BLAKE2b(X25519(server_sk, client_pk))
+  |<-- ServerHello [02][pubkey] ---|
+  |                                |
+  | derive shared key = BLAKE2b(X25519(client_sk, server_pk))
+  |                                |
+  Both have the same 32-byte session key.
+```
+
+Message format: `[1 byte type][32 bytes public key]` = 33 bytes per handshake message.
+
+### Packet Encryption: ChaCha20-Poly1305
+
+Each message is encrypted independently using AEAD (Authenticated Encryption with Associated Data). No dependency chain between packets — the server can decrypt any message without state from previous messages.
+
+```
+Encrypted packet format:
+[8 bytes nonce counter][16 bytes Poly1305 MAC][N bytes ciphertext]
+```
+
+- **ChaCha20** stream cipher for encryption — fast on all hardware including ARM/mobile
+- **Poly1305** MAC for authentication — detects any tampering
+- **Monotonic nonce counter** — prevents replay attacks (out-of-order packets rejected)
+- **24 bytes overhead** per packet (8 nonce + 16 MAC)
+- **Constant-time operations** — no timing side-channels
+
+### Why ChaCha20 Over AES
+
+- Faster than AES on hardware without AES-NI instructions (mobile, older CPUs, ARM)
+- Constant-time without hardware support (AES lookup tables leak timing information)
+- Simpler implementation, fewer attack vectors
+- Used by WireGuard, SSH, Google QUIC, TLS 1.3
+
+### Crypto Library: Monocypher
+
+Monocypher is vendored as a single .c/.h file (public domain). No external dependency, no build complexity. It provides X25519, ChaCha20-Poly1305, BLAKE2b, and secure memory wiping — exactly what we need, nothing more.
+
 ## Connection Lifecycle
 
 1. I/O thread accepts socket, creates `Connection` (socket + write queue), pushes `RawEvent::Connect` to `raw_queue_`

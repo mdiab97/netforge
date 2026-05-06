@@ -7,12 +7,14 @@ Designed for MMO/game server workloads: one I/O thread handles thousands of conn
 ## Features
 
 - **Event-loop architecture** — single I/O thread serves all connections (no thread-per-connection)
-- **Lock-free SPSC queues** — zero-mutex communication between game thread and I/O thread
+- **User-driven threading** — tick functions you call from your own threads, or auto-threaded convenience mode
+- **Lock-free SPSC queues** — zero-mutex communication between I/O, processing, and game threads
+- **Game-oriented encryption** — X25519 key exchange + ChaCha20-Poly1305 per-packet AEAD (no TLS overhead)
 - **Buffer pooling** — pre-allocated 4KB buffers, no allocation on hot path
 - **Compact wire format** — 4-byte header (`[u16 id][u16 size]`), max 64KB payload
 - **Non-blocking I/O** — all sockets non-blocking, driven by platform event loop
 - **Cross-platform** — Windows (WSAPoll) and Linux (epoll)
-- **Zero external dependencies** — no Boost, no ASIO, just platform APIs
+- **Minimal dependencies** — only [Monocypher](https://monocypher.org/) (vendored, single .c file, public domain)
 
 ## Performance
 
@@ -182,7 +184,8 @@ Max payload: 65,535 bytes per message.
 | Decision | Rationale |
 |----------|-----------|
 | User-driven threading (tick functions) | No hidden threads. You call `tick_io()`, `tick_process()`, `poll()` from whatever threads you want. Integrate into any architecture |
-| Separate I/O and processing | I/O stays lean (pure syscalls). Processing handles deserialization, future encryption/compression |
+| Separate I/O and processing | I/O stays lean (pure syscalls). Processing handles deserialization, encryption/decryption |
+| X25519 + ChaCha20-Poly1305 | Game-oriented crypto: 1 round-trip handshake, per-packet AEAD, no certificates. TLS is too heavy for game traffic |
 | Lock-free SPSC queues | Zero mutex contention between all three threads |
 | Buffer pool | Eliminates malloc/free on send/receive hot path |
 | Non-blocking + event loop | One syscall (poll/epoll_wait) checks all sockets at once |
@@ -191,6 +194,31 @@ Max payload: 65,535 bytes per message.
 | SharedData for broadcast | One serialized copy shared across all write queues, not N copies |
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full design documentation.
+
+## Encryption
+
+Game-oriented cryptography — no TLS, no certificates, no multi-round-trip handshakes.
+
+**Handshake (1 round-trip):**
+```
+Client                          Server
+  |--- ClientHello (pubkey) --->|
+  |<-- ServerHello (pubkey) ----|
+  Both derive shared key via X25519 + BLAKE2b
+```
+
+**Per-packet encryption:**
+```
+[8 bytes nonce counter][16 bytes MAC][N bytes ciphertext]
+```
+
+- **X25519** Diffie-Hellman key exchange — ephemeral keys, no certificates
+- **ChaCha20-Poly1305** AEAD — authenticated encryption, tamper-proof
+- **Monotonic nonce counter** — prevents replay attacks
+- **24 bytes overhead** per encrypted packet (8 nonce + 16 MAC)
+- **Powered by Monocypher** — single .c file, public domain, constant-time
+
+Why not TLS: TLS adds 2-3 round-trip handshakes, requires certificate infrastructure, encrypts the entire TCP stream (can't selectively encrypt), and adds unnecessary latency for game packets on trusted server infrastructure.
 
 ## Examples
 
@@ -201,19 +229,24 @@ See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for full design documentation.
 
 ```
 NetForge/
-├── include/netforge/     # Public API headers
-│   ├── server.hpp        # Event-loop server
-│   ├── client.hpp        # Poll-based client
-│   ├── message.hpp       # 4-byte header message format
-│   ├── connection.hpp    # Connection state struct
-│   ├── event_loop.hpp    # Platform I/O multiplexer
-│   ├── spsc_queue.hpp    # Lock-free ring buffer
-│   ├── buffer_pool.hpp   # Fixed-size buffer recycling
-│   └── transport.hpp     # Socket primitives
-├── src/                  # Implementations
-├── tests/                # Catch2 unit + stress tests
-├── examples/             # Echo and chat demos
-└── docs/                 # Architecture documentation
+├── include/netforge/        # Public API headers
+│   ├── server.hpp           # Event-loop server with tick functions
+│   ├── client.hpp           # Poll-based client
+│   ├── message.hpp          # 4-byte header message format
+│   ├── connection.hpp       # Connection state struct
+│   ├── event_loop.hpp       # Platform I/O multiplexer
+│   ├── spsc_queue.hpp       # Lock-free ring buffer
+│   ├── buffer_pool.hpp      # Fixed-size buffer recycling
+│   ├── transport.hpp        # Socket primitives
+│   └── crypto/
+│       ├── key_exchange.hpp # X25519 keypair generation and shared key derivation
+│       ├── packet_cipher.hpp# ChaCha20-Poly1305 per-packet AEAD
+│       └── handshake.hpp    # 1 round-trip key exchange protocol
+├── third_party/monocypher/  # Vendored crypto primitives (public domain)
+├── src/                     # Implementations
+├── tests/                   # Catch2 unit + stress + crypto tests
+├── examples/                # Echo and chat demos
+└── docs/                    # Architecture documentation
 ```
 
 ## License

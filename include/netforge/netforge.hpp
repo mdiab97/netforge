@@ -8,3 +8,6 @@
 #include "netforge/buffer_pool.hpp"
 #include "netforge/spsc_queue.hpp"
 #include "netforge/event_loop.hpp"
+#include "netforge/crypto/key_exchange.hpp"
+#include "netforge/crypto/packet_cipher.hpp"
+#include "netforge/crypto/handshake.hpp"
